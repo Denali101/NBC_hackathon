@@ -261,8 +261,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="localhost:8080")
     parser.add_argument("--scenario", default="normal_market")
-    parser.add_argument("--name", default="manual_trader", help="Quackonomics")
-    parser.add_argument("--password", required=True, help="Pegg3d_M1dpoint_Ordr$")
+    parser.add_argument("--name", default="manual_trader", help="Your team name")
+    parser.add_argument("--password", required=True, help="Your team password")
     parser.add_argument("--secure", action="store_true", help="Use HTTPS/WSS for secure connections")
     args = parser.parse_args()
     
