@@ -232,12 +232,9 @@ class TradingBot:
         ║    - Or return None to not send an order                          ║
         ╚══════════════════════════════════════════════════════════════════╝
         """
-       # =============================
-        # FLASH CRASH BEHAVIOR (YOU OWN THIS)
-        # =============================
+        ##Simple flash crash demo: do nothing during flash crash event
         if getattr(self, "in_flash_crash", False):
             # During flash crash: do NOTHING
-            # No orders, no inventory changes, full freeze
             return None
 
 
