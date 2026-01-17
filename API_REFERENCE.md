@@ -76,7 +76,6 @@ Base URL: `http://<host>:<port>/api/replays`
   "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
   "seed": 12345,
   "duration_sec": 300.0,
-  "command": "python student_algorithm.py --token abc123... --scenario normal_market --host localhost:8080"
 }
 ```
 
