@@ -212,6 +212,7 @@ class TradingBot:
     # YOUR STRATEGY - MODIFY THIS METHOD!
     # =========================================================================
     
+<<<<<<< Updated upstream:NBC_hackathon-main/student_algorithm.py
     def decide_order(self, bid: float, ask: float, mid: float) -> Optional[Dict]:
         """
         ╔══════════════════════════════════════════════════════════════════╗
@@ -239,6 +240,102 @@ class TradingBot:
 
 
     
+=======
+    def decide_order(self, bid: float, ask: float, mid: float):
+
+        # =============================
+        # SANITY CHECK
+        # =============================
+        if bid <= 0 or ask <= 0 or mid <= 0:
+            return None
+
+        # =============================
+        # CONFIG
+        # =============================
+        QTY_NORMAL = 100
+        QTY_RECOVERY = 100
+
+        EDGE_NORMAL = 0.05
+        EDGE_RECOVERY = 0.10
+
+        COOLDOWN_STEPS = 50
+        MAX_OPEN_ORDERS = 3        
+        STEP_INTERVAL = 10         
+
+        # =============================
+        # STATE INIT (ONCE)
+        # =============================
+        if not hasattr(self, "cooldown_until"):
+            self.cooldown_until = -1
+            self.prev_flash_state = False
+            self.open_orders = 0
+            self.last_inventory = self.inventory
+
+        # =============================
+        # TRACK FILLS (INVENTORY CHANGE)
+        # =============================
+        if self.inventory != self.last_inventory:
+            self.open_orders = max(0, self.open_orders - 1)
+            self.last_inventory = self.inventory
+
+        # =============================
+        # FLASH CRASH — HARD FREEZE
+        # =============================
+        if getattr(self, "in_flash_crash", False):
+            self.prev_flash_state = True
+            self.cooldown_until = self.current_step + COOLDOWN_STEPS
+            self.open_orders = 0
+            return None
+
+        # =============================
+        # COOLDOWN AFTER FLASH
+        # =============================
+        if self.prev_flash_state:
+            if self.current_step < self.cooldown_until:
+                return None
+            else:
+                self.prev_flash_state = False
+
+        # =============================
+        # RECOVERY MODE
+        # =============================
+        in_recovery = self.current_step < self.cooldown_until + 100
+
+        EDGE = EDGE_RECOVERY if in_recovery else EDGE_NORMAL
+        QTY = QTY_RECOVERY if in_recovery else QTY_NORMAL
+
+        # =============================
+        # RATE + ORDER LIMIT PROTECTION
+        # =============================
+        if self.current_step % STEP_INTERVAL != 0:
+            return None
+
+        if self.open_orders >= MAX_OPEN_ORDERS:
+            return None
+
+        # =============================
+        # ORDER DIRECTION (INVENTORY AWARE)
+        # =============================
+        if self.inventory >= 0:
+            side = "SELL"
+            price = round(mid + EDGE, 2)
+        else:
+            side = "BUY"
+            price = round(mid - EDGE, 2)
+
+        # =============================
+        # PLACE ORDER
+        # =============================
+        self.open_orders += 1
+
+        return {
+            "side": side,
+            "price": price,
+            "qty": QTY
+        }
+
+
+>>>>>>> Stashed changes:student_algorithm.py
     # =========================================================================
     # ORDER HANDLING
     # =========================================================================
