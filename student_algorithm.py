@@ -10,6 +10,7 @@ YOUR TASK:
 """
 
 import json
+import math
 import uuid
 
 import websocket
@@ -75,7 +76,7 @@ class MarketRegimeDetector:
         if recv_time is not None:
             self.recv_times.append(recv_time)
 
-    def classify(self):
+    def classify(self) -> str: # Returns the current market scenario
         if len(self.mid_prices) < 30:
             return "normal_market"
 
@@ -345,7 +346,7 @@ class TradingBot:
             # =============================================
             # YOUR STRATEGY LOGIC GOES HERE
             # =============================================
-            order = self.decide_order()
+            order = self.decide_order(self.last_bid, self.last_ask, self.last_mid)
 
             # ===== Send order if any =====
             if order is not None and self.order_ws and self.order_ws.sock:
@@ -382,79 +383,89 @@ class TradingBot:
         ╚══════════════════════════════════════════════════════════════════╝
         """
 
-        # Skip if no valid prices
+        # 1. GLOBAL SAFETY (Applies to ALL markets)
         if mid <= 0 or bid <= 0 or ask <= 0:
             return None
 
-        # =================================================================
-        # Normal_market Strategy:
-        # 1. Calculate Reservation Price (Inventory Skew):
-        #    - Shift the pricing "center" to encourage inventory balancing.
-        #    - Formula: Reserve_Price = Mid_Price - (Inventory * Skew_Factor)
-        #    - Result: If holding Long, quotes shift down (Sell faster, Buy lower).
-        #              If holding Short, quotes shift up (Buy faster, Sell higher).
-        #
-        # 2. Quote Dynamic Spreads:
-        #    - Calculate Bid/Ask around the Reservation Price, not the Mid.
-        #    - My_Bid = Reserve_Price - (Half_Spread)
-        #    - My_Ask = Reserve_Price + (Half_Spread)
-        #
-        #
-        #
-        # 4. Order Execution:
-        #    - If Inventory is safe (<500): Quote both sides (or alternate).
-        #    - If Inventory is heavy (>500): Prioritize the order that reduces risk.
-        # =================================================================
+        # Initialize open_orders if missing
+        if not hasattr(self, 'open_orders'):
+            self.open_orders = 0
 
-        # =================================================================
-        # HARD SAFETY CAP
-        # The rules say 5000 is the limit.
-        # We stop buying at 4800 to account for any "in-flight" delays.
-        # =================================================================
+        # =========================================================
+        # MARKET TYPE: NORMAL (The Danger Zone for Rate Limits)
+        # =========================================================
+        if self.current_market_type == "normal_market":
 
-        if self.current_step % 5 != 0:
+            # --- [FIX IS HERE] ---
+            # TRAFFIC LIGHT: If we have > 10 orders open, STOP sending.
+            # This prevents the Step 1000 crash.
+
+            # ---------------------
+
+            if self.current_step % 5 != 0:
+                return None
+
+            # Hard Stop (Inventory Cap)
+            if self.inventory >= 4800:
+                return {"side": "SELL", "price": bid, "qty": 100}
+            if self.inventory <= -4800:
+                return {"side": "BUY", "price": ask, "qty": 100}
+
+            # Simple Logic (Ping Pong)
+            my_bid = round(mid - 0.05, 2)
+            my_ask = round(mid + 0.05, 2)
+
+            if (self.current_step // 5) % 2 == 0:
+                return {"side": "BUY", "price": my_bid, "qty": 100}
+            else:
+                return {"side": "SELL", "price": my_ask, "qty": 100}
+
+        # =========================================================
+        # MARKET TYPE: STRESSED (The Sniper)
+        # =========================================================
+        elif self.current_market_type == "stressed_market":
+
+            # Hard Safety: If we have ANY open orders, we wait.
+            if self.open_orders > 0:
+                return None
+
+            # Rate Limit (Time): Only act every 20 steps
+            if self.current_step % 20 != 0:
+                return None
+
+            # Panic Dump
+            if self.inventory > 100:
+                return {"side": "SELL", "price": bid, "qty": 100}
+            if self.inventory < -100:
+                return {"side": "BUY", "price": ask, "qty": 100}
+
+            # Momentum Sniping
+            if not hasattr(self, 'price_history'):
+                self.price_history = []
+            self.price_history.append(mid)
+            if len(self.price_history) > 20: self.price_history.pop(0)
+
+            recent_avg = sum(self.price_history) / len(self.price_history) if self.price_history else mid
+
+            # Execution (Marketable Orders)
+            if mid < (recent_avg - 0.10):
+                if self.inventory < 1000:
+                    return {"side": "BUY", "price": ask, "qty": 100}
+
+            elif mid > (recent_avg + 0.10):
+                if self.inventory > -1000:
+                    return {"side": "SELL", "price": bid, "qty": 100}
+
             return None
 
-        # 1. Panic Sell (Too much inventory)
-        if self.inventory >= 4800:
-            # FORCE SELL: Ignore the skew, just sell below market to get out
-            return {"side": "SELL", "price": round(bid, 2), "qty": 100}
-
-        # 2. Panic Buy (Too much shorting)
-        if self.inventory <= -4800:
-            # FORCE BUY: Just buy at ask to cover
-            return {"side": "BUY", "price": round(ask, 2), "qty": 100}
-
-        # Only send orders every few steps to avoid overwhelming the system
-
-        mid = round(mid, 2)
-        skew = 0.001
-        current_spread = 0.02
-
-        reservation_price = mid - (self.inventory * skew)
-        my_bid = round(reservation_price - (current_spread / 2), 2)
-        my_ask = round(reservation_price + (current_spread / 2), 2)
-
-
-        # 4 possibilities:
-        # i) Low/negative inventory => buy aggressively
-        # ii) Nearing limit of 5k => sell aggressively
-        # otherwise alternate iii) buying 0.05 below mid and iv) selling 0.05 above mid
-        # python student_algorithm.py --name Quackonomics --password Pegg3d_M1dpoint_Ordr$ --scenario normal_market  --host 3.98.52.120:443 --secure
-
-
-        if self.inventory > 200:
-            return {"side": "SELL", "price": round(bid, 2), "qty": 100}
-
-        elif self.inventory < -200:
-            return {"side": "BUY", "price": round(ask, 2), "qty": 100}
-
-        elif (self.current_step // 5) % 2 == 0:
-            return {"side": "BUY","price": my_bid,"qty": 100}
+        # =========================================================
+        # MARKET TYPE: HFT / OTHER (Safety Fallback)
+        # =========================================================
         else:
-            return {"side": "SELL","price": my_ask,"qty": 100}
+            # If we see "hft_dominated" or "flash_crash", do nothing for now.
+            # This is safer than letting it fall through to undefined logic.
+            return None
 
-        getattr
     '''
     ELIZA ELIZA ELIZA ELIZA
     def decide_order(self, *args):

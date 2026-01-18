@@ -1,4 +1,4 @@
-
+ja
 # Exchange Simulator Application
 For NO SSL remove --secure flag
 ## Running the Application

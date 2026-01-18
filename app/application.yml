@@ -32,7 +32,7 @@ hackathon:
 
     expiration-minutes: 30
   rate-limit:
-    runs-per-hour: 10
+    runs-per-hour: 1000
   simulator:
     step-interval-ms: 100
     total-steps: 9000
