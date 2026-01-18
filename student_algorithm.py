@@ -10,7 +10,6 @@ YOUR TASK:
 """
 
 import json
-import math
 import uuid
 
 import websocket
@@ -76,86 +75,79 @@ class MarketRegimeDetector:
         if recv_time is not None:
             self.recv_times.append(recv_time)
 
-    def classify(self) -> str: # Returns the current market scenario
+    def classify(self):
         if len(self.mid_prices) < 30:
             return "normal_market"
 
         prices = np.array(self.mid_prices, dtype=float)
-        spreads = np.array(self.spreads)
-        times = np.array(self.timestamps)
+        spreads = np.array(self.spreads, dtype=float)
+        times = np.array(self.timestamps, dtype=float)
 
-        # Window stats (same window you already use via deques)
-        window_start_time = times[0]
-        window_seconds = max(1e-6, times[-1] - window_start_time)
+        window_seconds = max(1e-6, times[-1] - times[0])
 
-        # tick_rate (ticks/sec)
-        tick_rate = (len(times) - 1) / window_seconds
-
-        # change_rate (changes/sec)
-        changes = [c for (t, c) in self.change_flags if t >= window_start_time]
-        change_rate = sum(changes) / window_seconds
-
-        # churn: how often spread changes (0..1)
-        churn = float(np.mean(np.diff(spreads) != 0.0)) if len(spreads) > 1 else 0.0
-
-        # pct_min: % of window sitting at minimum spread (0..1)
-        min_spread = float(np.min(spreads))
-        pct_min = float(np.mean(spreads <= (min_spread + 1e-9)))
-        # Returns / vol
+        # === Volatility
         rets = np.diff(prices) / (prices[:-1] + 1e-9)
         vol = float(np.std(rets[-50:])) if len(rets) else 0.0
 
-        # =========================
-        # Crash detection: drawdown + rebound (robust)
-        # =========================
-        w = min(50, len(prices))
-        recent = prices[-w:]
-        peak = float(np.max(recent))
-        trough = float(np.min(recent))
-
-        drawdown = 0.0 if peak == 0 else (trough - peak) / peak  # negative
-        rebound = 0.0 if (peak - trough) == 0 else (recent[-1] - trough) / (peak - trough)
-
-        if drawdown < -0.03:
-            if rebound < 0.20:
-                return "flash_crash"
-            if rebound > 0.60:
-                return "mini_flash_crash"
-            return "stressed_market"
-
-        # =========================
-        # Stressed: vol or spread blowout
-        # =========================
+        # === Spread stats
         recent_spreads = spreads[-50:] if len(spreads) >= 50 else spreads
-        spread_baseline = float(np.median(recent_spreads)) if len(recent_spreads) else 0.0
+        spread_med = float(np.median(recent_spreads)) if len(recent_spreads) else 0.0
+        spread_cv = np.std(recent_spreads) / (spread_med + 1e-9) if len(recent_spreads) else 0.0
         last_spread = float(recent_spreads[-1]) if len(recent_spreads) else 0.0
 
-        if vol > 0.006 or (spread_baseline > 0 and last_spread > 1.8 * spread_baseline):
-            return "stressed_market"
+        # === Tick + churn
+        tick_rate = (len(times) - 1) / window_seconds
+        changes = sum(c for (_, c) in self.change_flags)
+        change_rate = changes / window_seconds
 
-        # =========================
-        # HFT: high message rate + high quote churn + tight spread most of the time
-        # =========================
-        tick_rate = 0.0
-        if len(self.recv_times) >= 10:
-            dt = self.recv_times[-1] - self.recv_times[0]
-            if dt > 0:
-                tick_rate = (len(self.recv_times) - 1) / dt  # msgs per second
+        # === Flash crash detection
+        recent = prices[-50:]
+        peak_idx = np.argmax(recent)
+        trough_idx = np.argmin(recent)
+        peak = recent[peak_idx]
+        trough = recent[trough_idx]
 
-        # churn: how often the mid changes (proxy for quote updates)
-        churn = float(np.mean(np.abs(np.diff(recent)) > 1e-9)) if len(recent) > 1 else 0.0
+        drawdown = 0.0 if peak == 0 else (trough - peak) / peak
+        drop_speed = abs(trough_idx - peak_idx) / len(recent)  # normalized time
+        rebound = 0.0
+        if trough_idx < len(recent) - 1:
+            rebound = (recent[-1] - trough) / (peak - trough + 1e-9)
 
-        min_spread = float(np.min(recent_spreads)) if len(recent_spreads) else 0.0
-        pct_at_min = float(np.mean(recent_spreads <= (min_spread + 1e-9))) if len(recent_spreads) else 0.0
-        spread_cv = float(np.std(recent_spreads) / (float(np.mean(recent_spreads)) + 1e-9)) if len(recent_spreads) else 0.0
+        # === Classify crash regimes
+        if drawdown < -0.015 and drop_speed < 0.7:
+            if rebound < 0.25:
+                new_regime = "flash_crash"
+            elif rebound > 0.60:
+                new_regime = "mini_flash_crash"
+            else:
+                new_regime = "stressed_market"
+        elif (
+                vol > 0.003
+                or spread_cv > 0.35
+                or (spread_med > 0 and last_spread > 1.5 * spread_med)
+                or change_rate > 10
+        ):
+            new_regime = "stressed_market"
+        else:
+            # HFT detection
+            churn = float(np.mean(np.abs(np.diff(prices[-15:])) > 1e-9)) if len(prices) > 15 else 0.0
+            min_spread = float(np.min(recent_spreads)) if len(recent_spreads) else 0.0
+            pct_min = float(np.mean(recent_spreads <= (min_spread + 1e-9))) if len(recent_spreads) else 0.0
 
-        # DEBUG every so often (temporary)
-        # if len(self.recv_times) >= 10 and len(self.mid_prices) % 50 == 0:
-        #     print(f"[DEBUG] tick_rate={tick_rate:.1f}/s churn={churn:.2f} pct_min={pct_at_min:.2f} vol={vol:.5f}")
-        # HFT: high message rate AND high change rate, with low volatility
-        if churn > 0.20 and pct_min < 0.95 and vol < 0.002:
-            return "hft_dominated"
-        return "normal_market"
+            if tick_rate > 15 and churn > 0.2 and pct_min < 0.9 and vol < 0.002:
+                new_regime = "hft_dominated"
+            else:
+                new_regime = "normal_market"
+
+        # === Debug print
+        if hasattr(self, "_last_regime"):
+            if new_regime != self._last_regime:
+                print(f"[Regime Shift] {self._last_regime} → {new_regime}")
+            self._last_regime = new_regime
+        else:
+            self._last_regime = new_regime
+
+        return new_regime
 
 
 class TradingBot:
@@ -202,11 +194,30 @@ class TradingBot:
         self.step_latencies = []            # Time between DONE and next market data
         self.order_send_times = {}          # order_id -> time sent
         self.fill_latencies = []            # Time between order and fill
+        self.last_order_time = 0.0
+        
+        self.last_mini_trade_time = 0
+
 
         # Market Regime Detector
         self.regime_detector = MarketRegimeDetector(window=100)
         self.current_market_type = "normal_market"
         self.open_orders = 0
+        # Strategy state (MUST exist before trading starts)
+        self.open_orders = 0
+        self.last_inventory = 0
+        self.has_open_order = False
+
+        self.last_hft_trade_step = -100
+        self.HFT_COOLDOWN = 15  # steps
+        self.HFT_MAX_INV = 300
+        self.hft_entry_price = None
+        self.hft_entry_step = None
+        self.HFT_HOLD_LIMIT = 120  # steps
+        self.HFT_EXIT_EDGE = 0.02
+        self.last_hft_trade_step = -10_000
+        self.pending_buys = 0
+        self.pending_sells = 0
 
 
     # =========================================================================
@@ -346,15 +357,25 @@ class TradingBot:
             # =============================================
             # YOUR STRATEGY LOGIC GOES HERE
             # =============================================
-            order = self.decide_order(self.last_bid, self.last_ask, self.last_mid)
+            order = self.decide_order(
+                self.last_bid,
+                self.last_ask,
+                self.last_mid
+            )
 
             # ===== Send order if any =====
             if order is not None and self.order_ws and self.order_ws.sock:
                 self._send_order(order)
-                self.open_orders += 1
+
             # Signal DONE to advance to next step
-            self._send_done()
-            
+            try:
+                if self.order_ws and self.order_ws.sock:
+                    self.order_ws.send(json.dumps({"action": "DONE"}))
+                    self.last_done_time = time.time()
+            except:
+                pass
+
+
         except Exception as e:
             print(f"[{self.student_id}] Market data error: {e}")
     
@@ -362,238 +383,285 @@ class TradingBot:
     # YOUR STRATEGY - MODIFY THIS METHOD!
     # =========================================================================
 
-    def decide_order(self, bid: float, ask: float, mid: float) -> Optional[Dict]:
-        """
-        ╔══════════════════════════════════════════════════════════════════╗
-        ║                    YOUR STRATEGY GOES HERE!                       ║
-        ╠══════════════════════════════════════════════════════════════════╣
-        ║  Input:                                                           ║
-        ║    - bid: Best bid price                                          ║
-        ║    - ask: Best ask price                                          ║
-        ║    - mid: Mid price (average of bid and ask)                      ║
-        ║                                                                   ║
-        ║  Available state:                                                 ║
-        ║    - self.inventory: Your current position                         ║
-        ║    - self.pnl: Your realized PnL                                  ║
-        ║    - self.current_step: Current simulation step                   ║
-        ║                                                                   ║
-        ║  Return:                                                          ║
-        ║    - {"side": "BUY"|"SELL", "price": X, "qty": N}                 ║
-        ║    - Or return None to not send an order                          ║
-        ╚══════════════════════════════════════════════════════════════════╝
-        """
-
-        # 1. GLOBAL SAFETY (Applies to ALL markets)
-        if mid <= 0 or bid <= 0 or ask <= 0:
+    def decide_order(self, bid: float, ask: float, mid: float):
+        if bid <= 0 or ask <= 0:
             return None
 
-        # Initialize open_orders if missing
-        if not hasattr(self, 'open_orders'):
-            self.open_orders = 0
+        # === SMART POSITION RISK LAYER ===
+        SOFT_LIMIT = 4500
+        HARD_LIMIT = 5000
+        QTY = 100
 
-        # =========================================================
-        # MARKET TYPE: NORMAL (The Danger Zone for Rate Limits)
-        # =========================================================
-        if self.current_market_type == "normal_market":
+        effective_inventory = self.inventory + self.pending_buys - self.pending_sells
+        self.too_close_to_limit = abs(effective_inventory) >= SOFT_LIMIT
 
-            # --- [FIX IS HERE] ---
-            # TRAFFIC LIGHT: If we have > 10 orders open, STOP sending.
-            # This prevents the Step 1000 crash.
+        # Absolute hard limit: emergency flatten
+        if effective_inventory >= HARD_LIMIT:
+            return {"side": "SELL", "price": round(bid, 2), "qty": QTY}
+        elif effective_inventory <= -HARD_LIMIT:
+            return {"side": "BUY", "price": round(ask, 2), "qty": QTY}
 
-            # ---------------------
+        # ===== ABSOLUTE SAFETY =====
+        if self.has_open_order and self.current_market_type != "hft_dominated":
+            return None
 
-            if self.current_step % 5 != 0:
+        # ===== PARAMETER SELECTION =====
+        regime = self.current_market_type
+       
+        if regime == "flash_crash":
+            QTY = 600
+            EDGE = 0.015
+            MAX_POS = 1000
+
+        elif regime == "mini_flash_crash":
+            QTY = 300
+            EDGE = 0.035
+            MAX_POS = 2400
+
+            now = time.time()
+            if now - self.last_mini_trade_time < 0.25:
                 return None
 
-            # Hard Stop (Inventory Cap)
-            if self.inventory >= 4800:
-                return {"side": "SELL", "price": bid, "qty": 100}
-            if self.inventory <= -4800:
-                return {"side": "BUY", "price": ask, "qty": 100}
-
-            # Simple Logic (Ping Pong)
-            my_bid = round(mid - 0.05, 2)
-            my_ask = round(mid + 0.05, 2)
-
-            if (self.current_step // 5) % 2 == 0:
-                return {"side": "BUY", "price": my_bid, "qty": 100}
-            else:
-                return {"side": "SELL", "price": my_ask, "qty": 100}
-
-        # =========================================================
-        # MARKET TYPE: STRESSED (The Sniper)
-        # =========================================================
-        elif self.current_market_type == "stressed_market":
-
-            # Hard Safety: If we have ANY open orders, we wait.
-            if self.open_orders > 0:
-                return None
-
-            # Rate Limit (Time): Only act every 20 steps
-            if self.current_step % 20 != 0:
-                return None
-
-            # Panic Dump
-            if self.inventory > 100:
-                return {"side": "SELL", "price": bid, "qty": 100}
-            if self.inventory < -100:
-                return {"side": "BUY", "price": ask, "qty": 100}
-
-            # Momentum Sniping
-            if not hasattr(self, 'price_history'):
-                self.price_history = []
-            self.price_history.append(mid)
-            if len(self.price_history) > 20: self.price_history.pop(0)
-
-            recent_avg = sum(self.price_history) / len(self.price_history) if self.price_history else mid
-
-            # Execution (Marketable Orders)
-            if mid < (recent_avg - 0.10):
-                if self.inventory < 1000:
-                    return {"side": "BUY", "price": ask, "qty": 100}
-
-            elif mid > (recent_avg + 0.10):
-                if self.inventory > -1000:
-                    return {"side": "SELL", "price": bid, "qty": 100}
-
-            return None
-
-        # =========================================================
-        # MARKET TYPE: HFT / OTHER (Safety Fallback)
-        # =========================================================
-        else:
-            # If we see "hft_dominated" or "flash_crash", do nothing for now.
-            # This is safer than letting it fall through to undefined logic.
-            return None
-
-    '''
-    ELIZA ELIZA ELIZA ELIZA
-    def decide_order(self, *args):
-        # Support both call styles:
-        # - decide_order() uses self.last_bid/self.last_ask
-        # - decide_order(bid, ask) or decide_order(bid, ask, mid)
-        if len(args) >= 2:
-            bid = args[0]
-            ask = args[1]
-        else:
-            bid = getattr(self, "last_bid", None)
-            ask = getattr(self, "last_ask", None)
-
-        if bid is None or ask is None:
-            return None
-
-        bid = float(bid)
-        ask = float(ask)
-        if bid <= 0 or ask <= 0 or ask <= bid:
-            return None
-
-        # Required state
-        if not hasattr(self, "open_orders"):
-            self.open_orders = 0
-        if not hasattr(self, "inventory"):
-            self.inventory = 0
-        if not hasattr(self, "_last_order_step"):
-            self._last_order_step = -10 ** 9
-
-        spread = ask - bid
-        mid = (bid + ask) / 2.0
-        tick = 0.10
-        qty = 100
-        max_inv = 600
-
-        mkt = getattr(self, "current_market_type", "normal_market")
-
-        # ---------- Hard safety ----------
-        # If you don't have cancel logic, spamming = guaranteed rate-limit.
-        # Keep at most 1 outstanding order at a time.
-        if self.open_orders >= 1:
-            return None
-
-        # Don't place orders too frequently
-        # (reduces adverse selection + avoids open-order buildup)
-        cooldown = 8 if mkt == "hft_dominated" else 4
-        if (self.current_step - self._last_order_step) < cooldown:
-            return None
-
-        # If inventory is too large, ONLY unwind (do not "trade")
-        if abs(self.inventory) >= max_inv:
-            if self.inventory > 0:
-                self._last_order_step = self.current_step
-                return {"side": "SELL", "price": bid, "qty": qty}
-            else:
-                self._last_order_step = self.current_step
-                return {"side": "BUY", "price": ask, "qty": qty}
-
-        # ---------- Regime rules ----------
-        # Crash/stress: stop market making, only flatten risk
-        if mkt in ("stressed_market", "mini_flash_crash", "flash_crash"):
-            if self.inventory > 0:
-                self._last_order_step = self.current_step
-                return {"side": "SELL", "price": bid, "qty": qty}
-            if self.inventory < 0:
-                self._last_order_step = self.current_step
-                return {"side": "BUY", "price": ask, "qty": qty}
-            return None
-
-        # HFT-dominated: if spread is tight, DO NOT play (fees + adverse selection kill you)
-        # Only consider trading when there's real edge (spread wide enough)
-        if mkt == "hft_dominated":
-            if spread < 3 * tick:
-                return None
-
-            # If flat, be picky: place ONE passive order at best price, not inside
-            # (inside quotes get picked off fast)
-            prev_mid = getattr(self, "_prev_mid", mid)
-            mom = mid - prev_mid
-            self._prev_mid = mid
-
-            if self.inventory == 0:
-                if mom > 0:
-                    self._last_order_step = self.current_step
-                    return {"side": "SELL", "price": ask, "qty": qty}
-                elif mom < 0:
-                    self._last_order_step = self.current_step
-                    return {"side": "BUY", "price": bid, "qty": qty}
-                else:
+            self.last_mini_trade_time = now
+            if (ask - bid) < EDGE * 2:
                     return None
+        elif regime == "hft_dominated":
+            BASE_QTY = 100
+            MAX_QTY = 200
+            EDGE = 0.01
+            COOLDOWN = 5
+            HOLD_LIMIT = 20
+            SLIPPAGE_LIMIT = 0.004
+            HARD_LIMIT = 5000
+            REENTRY_DELAY = 10
 
-            # If holding inventory, unwind at touch
-            if self.inventory > 0:
-                self._last_order_step = self.current_step
-                return {"side": "SELL", "price": ask, "qty": qty}
+            # === Effective inventory ===
+            effective_pos = self.inventory + self.pending_buys - self.pending_sells
+
+            # === Init state ===
+            if not hasattr(self, "hft_state"):
+                self.hft_state = {
+                    "mid_history": deque(maxlen=10),
+                    "last_entry_step": -1000,
+                    "entry_price": None,
+                    "direction": None,
+                    "trend_age": 0,
+                }
+
+            if not hasattr(self, "hft_last_exit_step"):
+                self.hft_last_exit_step = -1000
+
+            # === Cooldown / reentry delay ===
+            if (self.current_step - self.hft_state["last_entry_step"] < COOLDOWN or
+                    self.current_step - self.hft_last_exit_step < REENTRY_DELAY):
+                return None
+
+            # === Update trend memory ===
+            self.hft_state["mid_history"].append(mid)
+            history = list(self.hft_state["mid_history"])
+            if len(history) < 6:
+                return None
+
+            trend = history[-1] - history[0]
+            trend_confidence = abs(trend)
+            rand_factor = np.random.rand()
+            in_position = self.inventory != 0
+
+            # === Dynamically scale QTY based on trend confidence ===
+            scaled_qty = BASE_QTY if trend_confidence < 0.005 else MAX_QTY
+
+            # === ENTRY ===
+            if not in_position:
+                if trend > EDGE and rand_factor > 0.4 and effective_pos + scaled_qty <= HARD_LIMIT and not self.too_close_to_limit:
+                    self.hft_state.update({
+                        "last_entry_step": self.current_step,
+                        "entry_price": mid,
+                        "direction": "LONG",
+                        "trend_age": 0
+                    })
+                    return {
+                        "side": "BUY",
+                        "price": round(bid + EDGE, 2),
+                        "qty": scaled_qty
+                    }
+
+                elif trend < -EDGE and rand_factor > 0.4 and effective_pos - scaled_qty >= -HARD_LIMIT and not self.too_close_to_limit:
+                    self.hft_state.update({
+                        "last_entry_step": self.current_step,
+                        "entry_price": mid,
+                        "direction": "SHORT",
+                        "trend_age": 0
+                    })
+                    return {
+                        "side": "SELL",
+                        "price": round(ask - EDGE, 2),
+                        "qty": scaled_qty
+                    }
+
+            # === EXIT ===
             else:
-                self._last_order_step = self.current_step
-                return {"side": "BUY", "price": bid, "qty": qty}
+                direction = self.hft_state["direction"]
+                entry_price = self.hft_state["entry_price"]
+                time_held = self.current_step - self.hft_state["last_entry_step"]
+                self.hft_state["trend_age"] += 1
 
-        # Normal market: simple “buy bid / sell ask” inventory-leaning
-        # Flat: alternate sides based on tiny momentum to avoid deadlock
-        prev_mid = getattr(self, "_prev_mid", mid)
-        mom = mid - prev_mid
-        self._prev_mid = mid
+                exit_qty = BASE_QTY
+                exit_cond = False
 
-        if self.inventory > 0:
-            self._last_order_step = self.current_step
-            return {"side": "SELL", "price": ask, "qty": qty}
-        if self.inventory < 0:
-            self._last_order_step = self.current_step
-            return {"side": "BUY", "price": bid, "qty": qty}
+                if direction == "LONG":
+                    gain = mid - entry_price
+                    loss = entry_price - mid
+                    if gain >= EDGE or time_held > HOLD_LIMIT or loss > SLIPPAGE_LIMIT:
+                        exit_cond = True
 
-        if mom > 0:
-            self._last_order_step = self.current_step
-            return {"side": "SELL", "price": ask, "qty": qty}
-        if mom < 0:
-            self._last_order_step = self.current_step
-            return {"side": "BUY", "price": bid, "qty": qty}
+                elif direction == "SHORT":
+                    gain = entry_price - mid
+                    loss = mid - entry_price
+                    if gain >= EDGE or time_held > HOLD_LIMIT or loss > SLIPPAGE_LIMIT:
+                        exit_cond = True
 
-        return None
-    '''
+                if exit_cond:
+                    self.hft_last_exit_step = self.current_step
+                    self.hft_state["last_entry_step"] = self.current_step
+                    side = "SELL" if direction == "LONG" else "BUY"
+                    price = round(ask - EDGE, 2) if direction == "LONG" else round(bid + EDGE, 2)
+
+                    if (side == "SELL" and effective_pos - exit_qty >= -HARD_LIMIT) or \
+                            (side == "BUY" and effective_pos + exit_qty <= HARD_LIMIT):
+                        return {"side": side, "price": price, "qty": exit_qty}
+
+            return None
+        elif regime == "stressed_market":
+            BASE_QTY = 100
+            EDGE = 0.02
+            HARD_LIMIT = 5000
+            TRADE_EVERY = 4  # throttle: only trade every 4 steps
+
+            effective_pos = self.inventory + self.pending_buys - self.pending_sells
+
+            # Step throttle
+            if self.current_step % TRADE_EVERY != 0:
+                return None
+
+            # Init mid history
+            if not hasattr(self, "stressed_mid_history"):
+                self.stressed_mid_history = deque(maxlen=15)
+            if not hasattr(self, "last_stressed_trade_step"):
+                self.last_stressed_trade_step = -1000
+
+            self.stressed_mid_history.append(mid)
+            if len(self.stressed_mid_history) < 10:
+                return None
+
+            recent_avg = sum(self.stressed_mid_history) / len(self.stressed_mid_history)
+            deviation = mid - recent_avg
+
+            # Emergency flatten if beyond hard limits
+            if effective_pos >= HARD_LIMIT:
+                return {"side": "SELL", "price": round(bid, 2), "qty": BASE_QTY}
+            if effective_pos <= -HARD_LIMIT:
+                return {"side": "BUY", "price": round(ask, 2), "qty": BASE_QTY}
+
+            # === Mean-reversion fade logic ===
+            if deviation < -EDGE and effective_pos + BASE_QTY <= HARD_LIMIT and not self.too_close_to_limit:
+                self.last_stressed_trade_step = self.current_step
+                return {"side": "BUY", "price": round(bid + 0.01, 2), "qty": BASE_QTY}
+
+            elif deviation > EDGE and effective_pos - BASE_QTY >= -HARD_LIMIT and not self.too_close_to_limit:
+                self.last_stressed_trade_step = self.current_step
+                return {"side": "SELL", "price": round(ask - 0.01, 2), "qty": BASE_QTY}
+
+            # === Passive unwind occasionally ===
+            if abs(self.inventory) > 0 and np.random.rand() > 0.97:
+                side = "SELL" if self.inventory > 0 else "BUY"
+                price = round(bid + 0.01, 2) if side == "BUY" else round(ask - 0.01, 2)
+                self.last_stressed_trade_step = self.current_step
+                return {"side": side, "price": price, "qty": BASE_QTY}
+
+            return None
+        elif regime == "normal_market":
+            BASE_QTY = 100
+            EDGE = 0.015
+            HARD_LIMIT = 5000
+            TRADE_EVERY = 3  # throttle frequency
+
+            effective_pos = self.inventory + self.pending_buys - self.pending_sells
+
+            if self.current_step % TRADE_EVERY != 0:
+                return None
+
+            # Emergency flatten
+            if effective_pos >= HARD_LIMIT:
+                return {"side": "SELL", "price": round(bid, 2), "qty": BASE_QTY}
+            if effective_pos <= -HARD_LIMIT:
+                return {"side": "BUY", "price": round(ask, 2), "qty": BASE_QTY}
+
+            # === Trend bias helper ===
+            if not hasattr(self, "trend_buffer"):
+                self.trend_buffer = deque(maxlen=10)
+            self.trend_buffer.append(mid)
+            if len(self.trend_buffer) < self.trend_buffer.maxlen:
+                return None
+
+            avg_mid = sum(self.trend_buffer) / len(self.trend_buffer)
+            trend = mid - avg_mid  # positive = upward trend
+
+            # === Buy low logic ===
+            if bid < avg_mid - EDGE and not self.too_close_to_limit and effective_pos + BASE_QTY <= HARD_LIMIT:
+                return {"side": "BUY", "price": round(bid + 0.01, 2), "qty": BASE_QTY}
+
+            # === Sell high logic ===
+            if ask > avg_mid + EDGE and not self.too_close_to_limit and effective_pos - BASE_QTY >= -HARD_LIMIT:
+                return {"side": "SELL", "price": round(ask - 0.01, 2), "qty": BASE_QTY}
+
+            # === Flatten passively ===
+            if abs(self.inventory) > 0 and np.random.rand() > 0.98:
+                side = "SELL" if self.inventory > 0 else "BUY"
+                price = round(ask - 0.01, 2) if side == "SELL" else round(bid + 0.01, 2)
+                return {"side": side, "price": price, "qty": BASE_QTY}
+
+            return None
+
+        # ===== FORCE FLATTEN =====
+        if self.inventory > MAX_POS:
+            return {
+                "side": "SELL",
+                "price": round(bid, 2),
+                "qty": QTY
+            }
+
+        if self.inventory < -MAX_POS:
+            return {
+                "side": "BUY",
+                "price": round(ask, 2),
+                "qty": QTY
+            }
+
+        # ===== PURE FADE / SPREAD CAPTURE =====
+        if self.inventory <= 0:
+            # Buy slightly inside bid
+            return {
+                "side": "BUY",
+                "price": round(bid + EDGE, 2),
+                "qty": QTY
+            }
+
+        # Sell slightly inside ask
+        return {
+            "side": "SELL",
+            "price": round(ask - EDGE, 2),
+            "qty": QTY
+        }
+
+
+
+
 
     # =========================================================================
     # ORDER HANDLING
     # =========================================================================
 
-    def _send_order(self, order: Dict):
-        """Send an order to the exchange."""
+    def _send_order(self, order):
         order_id = f"ORD_{self.student_id}_{self.current_step}_{self.orders_sent}"
 
         msg = {
@@ -603,21 +671,18 @@ class TradingBot:
             "qty": order["qty"]
         }
 
-        try:
-            self.order_send_times[order_id] = time.time()  # Track send time
-            self.order_ws.send(json.dumps(msg))
-            self.open_orders += 1
-            self.orders_sent += 1
-        except Exception as e:
-            print(f"[{self.student_id}] Send order error: {e}")
+        self.order_ws.send(json.dumps(msg))
+        self.has_open_order = True
+        self.orders_sent += 1
+        self.order_send_times[order_id] = time.time()
 
-    def _send_done(self):
-        """Signal DONE to advance to the next simulation step."""
-        try:
-            self.order_ws.send(json.dumps({"action": "DONE"}))
-            self.last_done_time = time.time()  # Track when we sent DONE
-        except:
-            pass
+        # === Track pending inventory ===
+        if order["side"] == "BUY":
+            self.pending_buys += order["qty"]
+        else:
+            self.pending_sells += order["qty"]
+
+        print(f"[{self.student_id}] Sent order: {msg}")
 
     def _on_order_response(self, ws, message: str):
         """Handle order responses and fills."""
@@ -630,35 +695,37 @@ class TradingBot:
                 print(f"[{self.student_id}] Authenticated - ready to trade!")
 
             elif msg_type == "FILL":
-                qty = data.get("qty", 0)
-                price = data.get("price", 0)
-                side = data.get("side", "")
-                order_id = data.get("order_id", "")
+                self.has_open_order = False
 
-                # Measure fill latency
-                if order_id in self.order_send_times:
-                    fill_latency = (recv_time - self.order_send_times[order_id]) * 1000  # ms
-                    self.fill_latencies.append(fill_latency)
-                    del self.order_send_times[order_id]
+                qty = data["qty"]
+                price = data["price"]
 
-                # Update inventory and cash flow
-                if side == "BUY":
+                if data["side"] == "BUY":
+                    self.pending_buys -= qty
+                else:
+                    self.pending_sells -= qty
+                if data["side"] == "BUY":
                     self.inventory += qty
-                    self.cash_flow -= qty * price  # Spent cash to buy
+                    self.cash_flow -= qty * price
                 else:
                     self.inventory -= qty
-                    self.cash_flow += qty * price  # Received cash from selling
+                    self.cash_flow += qty * price
 
-                # Calculate mark-to-market PnL using mid price
                 self.pnl = self.cash_flow + self.inventory * self.last_mid
-                self.open_orders = max(0, self.open_orders - 1)
-                print(f"[{self.student_id}] FILL: {side} {qty} @ {price:.2f} | Inventory: {self.inventory} | PnL: {self.pnl:.2f}")
-
-            elif msg_type == "ERROR":
-                print(f"[{self.student_id}] ERROR: {data.get('message')}")
-
+                print(f"FILL {data['side']} {qty} @ {price} | Inv {self.inventory} | PnL {self.pnl:.2f}")
+                # Measure fill latency
+                order_id = data.get("order_id")     
+                if order_id in self.order_send_times:
+                    send_time = self.order_send_times.pop(order_id)
+                    fill_latency = (recv_time - send_time) * 1000  # ms
+                    self.fill_latencies.append(fill_latency)
+            elif msg_type == "REJECTED":
+                self.has_open_order = False
+                print(f"[{self.student_id}] Order REJECTED: {data}")
         except Exception as e:
             print(f"[{self.student_id}] Order response error: {e}")
+
+
 
     # =========================================================================
     # ERROR HANDLING
