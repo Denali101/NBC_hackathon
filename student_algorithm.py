@@ -360,6 +360,101 @@ class TradingBot:
     # =========================================================================
     # YOUR STRATEGY - MODIFY THIS METHOD!
     # =========================================================================
+
+    def decide_order(self, bid: float, ask: float, mid: float) -> Optional[Dict]:
+        """
+        ╔══════════════════════════════════════════════════════════════════╗
+        ║                    YOUR STRATEGY GOES HERE!                       ║
+        ╠══════════════════════════════════════════════════════════════════╣
+        ║  Input:                                                           ║
+        ║    - bid: Best bid price                                          ║
+        ║    - ask: Best ask price                                          ║
+        ║    - mid: Mid price (average of bid and ask)                      ║
+        ║                                                                   ║
+        ║  Available state:                                                 ║
+        ║    - self.inventory: Your current position                         ║
+        ║    - self.pnl: Your realized PnL                                  ║
+        ║    - self.current_step: Current simulation step                   ║
+        ║                                                                   ║
+        ║  Return:                                                          ║
+        ║    - {"side": "BUY"|"SELL", "price": X, "qty": N}                 ║
+        ║    - Or return None to not send an order                          ║
+        ╚══════════════════════════════════════════════════════════════════╝
+        """
+
+        # Skip if no valid prices
+        if mid <= 0 or bid <= 0 or ask <= 0:
+            return None
+
+        # =================================================================
+        # Normal_market Strategy:
+        # 1. Calculate Reservation Price (Inventory Skew):
+        #    - Shift the pricing "center" to encourage inventory balancing.
+        #    - Formula: Reserve_Price = Mid_Price - (Inventory * Skew_Factor)
+        #    - Result: If holding Long, quotes shift down (Sell faster, Buy lower).
+        #              If holding Short, quotes shift up (Buy faster, Sell higher).
+        #
+        # 2. Quote Dynamic Spreads:
+        #    - Calculate Bid/Ask around the Reservation Price, not the Mid.
+        #    - My_Bid = Reserve_Price - (Half_Spread)
+        #    - My_Ask = Reserve_Price + (Half_Spread)
+        #
+        #
+        #
+        # 4. Order Execution:
+        #    - If Inventory is safe (<500): Quote both sides (or alternate).
+        #    - If Inventory is heavy (>500): Prioritize the order that reduces risk.
+        # =================================================================
+
+        # =================================================================
+        # HARD SAFETY CAP
+        # The rules say 5000 is the limit.
+        # We stop buying at 4800 to account for any "in-flight" delays.
+        # =================================================================
+
+        if self.current_step % 5 != 0:
+            return None
+
+        # 1. Panic Sell (Too much inventory)
+        if self.inventory >= 4800:
+            # FORCE SELL: Ignore the skew, just sell below market to get out
+            return {"side": "SELL", "price": round(bid, 2), "qty": 100}
+
+        # 2. Panic Buy (Too much shorting)
+        if self.inventory <= -4800:
+            # FORCE BUY: Just buy at ask to cover
+            return {"side": "BUY", "price": round(ask, 2), "qty": 100}
+
+        # Only send orders every few steps to avoid overwhelming the system
+
+        mid = round(mid, 2)
+        skew = 0.001
+        current_spread = 0.02
+
+        reservation_price = mid - (self.inventory * skew)
+        my_bid = round(reservation_price - (current_spread / 2), 2)
+        my_ask = round(reservation_price + (current_spread / 2), 2)
+
+
+        # 4 possibilities:
+        # i) Low/negative inventory => buy aggressively
+        # ii) Nearing limit of 5k => sell aggressively
+        # otherwise alternate iii) buying 0.05 below mid and iv) selling 0.05 above mid
+        # python student_algorithm.py --name Quackonomics --password Pegg3d_M1dpoint_Ordr$ --scenario normal_market  --host 3.98.52.120:8433 --secure
+
+
+        if self.inventory > 200:
+            return {"side": "SELL", "price": round(bid, 2), "qty": 100}
+
+        elif self.inventory < -200:
+            return {"side": "BUY", "price": round(ask, 2), "qty": 100}
+
+        elif (self.current_step // 5) % 2 == 0:
+            return {"side": "BUY","price": my_bid,"qty": 100}
+        else:
+            return {"side": "SELL","price": my_ask,"qty": 100}
+    '''
+    ELIZA ELIZA ELIZA ELIZA
     def decide_order(self, *args):
         # Support both call styles:
         # - decide_order() uses self.last_bid/self.last_ask
@@ -478,6 +573,7 @@ class TradingBot:
             return {"side": "BUY", "price": bid, "qty": qty}
 
         return None
+    '''
 
     # =========================================================================
     # ORDER HANDLING
