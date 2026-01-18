@@ -388,57 +388,139 @@ class TradingBot:
         if self.has_open_order:
             return None
 
-        # ===== PARAMETER SELECTION =====
         regime = self.current_market_type
-       
+
+        # =========================
+        # PARAMETER SELECTION
+        # =========================
         if regime == "flash_crash":
             QTY = 500
             EDGE = 0.015
             MAX_POS = 1000
-
+    
         elif regime == "mini_flash_crash":
             QTY = 300
             EDGE = 0.035
-            MAX_POS = 2400
+            MAX_POS = 1200
 
+            # --- throttle ---
             now = time.time()
+            if not hasattr(self, "last_mini_trade_time"):
+                self.last_mini_trade_time = 0.0
+
             if now - self.last_mini_trade_time < 0.25:
                 return None
 
             self.last_mini_trade_time = now
-            if (ask - bid) < EDGE * 2:
-                    return None
-            
-        else: # normal_market 
-            QTY = 500
-            EDGE = 0.015
-            MAX_POS = 1000
 
-            if self.current_step % 5 != 0:
+            # --- spread filter ---
+            if (ask - bid) < EDGE * 2:
                 return None
 
-            if self.inventory >= 4800:
-                return {'side': 'SELL', 'price': bid, 'qty': 100}
-            if self.inventory <= -4800:
-                return {'side': 'BUY', 'price': ask, 'qty': 100} 
+            # =========================
+            # 🔑 MINI-FLASH FIX (NEW)
+            # Only fade REAL extremes
+            # =========================
+            if not hasattr(self, "mini_anchor"):
+                self.mini_anchor = mid
 
-            mybid = round(mid - 0.05, 2)
-            myask = round(mid + 0.05, 2)
+            # slow anchor update
+            self.mini_anchor = 0.98 * self.mini_anchor + 0.02 * mid
 
-            if (self.current_step // 5) % 2 == 0:
+            deviation = mid - self.mini_anchor
+
+            # skip weak moves (this stops the bleeding)
+            if abs(deviation) < EDGE * 3:
+                return None
+
+        else:  # normal_market
+        
+            BASE_QTY = 500
+            BIG_QTY = 900
+            EDGE = 0.02
+            MAX_POS = 1200
+
+            # =========================
+            # SHORT-TERM ANCHOR
+            # =========================
+            if not hasattr(self, "normal_anchor"):
+                self.normal_anchor = mid
+
+            # very slow anchor (prevents noise)
+            self.normal_anchor = 0.995 * self.normal_anchor + 0.005 * mid
+
+            deviation = mid - self.normal_anchor
+            abs_dev = abs(deviation)
+
+            # =========================
+            # NO MOVE → NO TRADE
+            # =========================
+            if abs_dev < 0.06:
+                return None
+
+            # =========================
+            # SIZE UP ONLY WHEN IT MATTERS
+            # =========================
+            qty = BIG_QTY if abs_dev > 0.12 else BASE_QTY
+
+            # =========================
+            # INVENTORY SAFETY
+            # =========================
+            if self.inventory >= MAX_POS:
+                return {"side": "SELL", "price": bid, "qty": BASE_QTY}
+
+            if self.inventory <= -MAX_POS:
+                return {"side": "BUY", "price": ask, "qty": BASE_QTY}
+
+            # =========================
+            # MEAN REVERSION HIT
+            # =========================
+            if deviation < 0:
+                # price stretched DOWN → buy
                 return {
                     "side": "BUY",
-                    "price": mybid,
-                    "qty": 100
+                    "price": round(bid + EDGE, 2),
+                    "qty": qty
+                }
+            else:
+                # price stretched UP → sell
+                return {
+                    "side": "SELL",
+                    "price": round(ask - EDGE, 2),
+                    "qty": qty
+                }
+
+            # =========================
+            # SMART SPREAD CAPTURE
+            # =========================
+            spread = ask - bid
+
+            # if spread is too tight, don't bother
+            if spread < 0.02:
+                return None
+
+            # quote INSIDE the spread
+            buy_price = round(bid + EDGE, 2)
+            sell_price = round(ask - EDGE, 2)
+
+            # lean based on inventory
+            if self.inventory <= 0:
+                return {
+                    "side": "BUY",
+                    "price": buy_price,
+                    "qty": QTY
                 }
             else:
                 return {
                     "side": "SELL",
-                    "price": myask,
-                    "qty": 100
+                    "price": sell_price,
+                    "qty": QTY
                 }
 
-        # ===== FORCE FLATTEN =====
+
+        # =========================
+        # FORCE FLATTEN
+        # =========================
         if self.inventory > MAX_POS:
             return {
                 "side": "SELL",
@@ -453,16 +535,16 @@ class TradingBot:
                 "qty": QTY
             }
 
-        # ===== PURE FADE / SPREAD CAPTURE =====
+        # =========================
+        # PURE FADE / SPREAD CAPTURE
+        # =========================
         if self.inventory <= 0:
-            # Buy slightly inside bid
             return {
                 "side": "BUY",
                 "price": round(bid + EDGE, 2),
                 "qty": QTY
             }
 
-        # Sell slightly inside ask
         return {
             "side": "SELL",
             "price": round(ask - EDGE, 2),
