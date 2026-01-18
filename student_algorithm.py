@@ -440,7 +440,7 @@ class TradingBot:
         # i) Low/negative inventory => buy aggressively
         # ii) Nearing limit of 5k => sell aggressively
         # otherwise alternate iii) buying 0.05 below mid and iv) selling 0.05 above mid
-        # python student_algorithm.py --name Quackonomics --password Pegg3d_M1dpoint_Ordr$ --scenario normal_market  --host 3.98.52.120:8433 --secure
+        # python student_algorithm.py --name Quackonomics --password Pegg3d_M1dpoint_Ordr$ --scenario normal_market  --host 3.98.52.120:443 --secure
 
 
         if self.inventory > 200:
@@ -453,6 +453,8 @@ class TradingBot:
             return {"side": "BUY","price": my_bid,"qty": 100}
         else:
             return {"side": "SELL","price": my_ask,"qty": 100}
+
+        getattr
     '''
     ELIZA ELIZA ELIZA ELIZA
     def decide_order(self, *args):
