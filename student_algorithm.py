@@ -202,6 +202,9 @@ class TradingBot:
         self.order_send_times = {}          # order_id -> time sent
         self.fill_latencies = []            # Time between order and fill
         self.last_order_time = 0.0
+        
+        self.last_mini_trade_time = 0
+
 
         # Market Regime Detector
         self.regime_detector = MarketRegimeDetector(window=100)
@@ -385,9 +388,55 @@ class TradingBot:
         if self.has_open_order:
             return None
 
-        QTY = 600
-        EDGE = 0.015
-        MAX_POS = 1000
+        # ===== PARAMETER SELECTION =====
+        regime = self.current_market_type
+       
+        if regime == "flash_crash":
+            QTY = 500
+            EDGE = 0.015
+            MAX_POS = 1000
+
+        elif regime == "mini_flash_crash":
+            QTY = 300
+            EDGE = 0.035
+            MAX_POS = 2400
+
+            now = time.time()
+            if now - self.last_mini_trade_time < 0.25:
+                return None
+
+            self.last_mini_trade_time = now
+            if (ask - bid) < EDGE * 2:
+                    return None
+            
+        else: # normal_market 
+            QTY = 500
+            EDGE = 0.015
+            MAX_POS = 1000
+
+            if self.current_step % 5 != 0:
+                return None
+
+            if self.inventory >= 4800:
+                return {'side': 'SELL', 'price': bid, 'qty': 100}
+            if self.inventory <= -4800:
+                return {'side': 'BUY', 'price': ask, 'qty': 100} 
+
+            mybid = round(mid - 0.05, 2)
+            myask = round(mid + 0.05, 2)
+
+            if (self.current_step // 5) % 2 == 0:
+                return {
+                    "side": "BUY",
+                    "price": mybid,
+                    "qty": 100
+                }
+            else:
+                return {
+                    "side": "SELL",
+                    "price": myask,
+                    "qty": 100
+                }
 
         # ===== FORCE FLATTEN =====
         if self.inventory > MAX_POS:
@@ -404,7 +453,7 @@ class TradingBot:
                 "qty": QTY
             }
 
-        # ===== PURE SPREAD CAPTURE =====
+        # ===== PURE FADE / SPREAD CAPTURE =====
         if self.inventory <= 0:
             # Buy slightly inside bid
             return {
@@ -419,6 +468,7 @@ class TradingBot:
             "price": round(ask - EDGE, 2),
             "qty": QTY
         }
+
 
 
 
