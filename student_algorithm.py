@@ -194,17 +194,6 @@ class TradingBot:
             else:
                 self.last_mid = 0
 
-            # Mark-to-market PnL every step (even without fills)
-            self.pnl = self.cash_flow + self.inventory * self.last_mid
-
-            # Print PnL every 50 steps (change 50 -> 1 if you want literally every step)
-            if self.current_step % 50 == 0:
-                print(
-                        f"[{self.student_id}] Step {self.current_step} | "
-                        f"Bid: {self.last_bid:.2f} Ask: {self.last_ask:.2f} Mid: {self.last_mid:.2f} | "
-                        f"Inv: {self.inventory} | Cash: {self.cash_flow:.2f} | PnL: {self.pnl:.2f}"
-                )
-
             # =============================================
             # YOUR STRATEGY LOGIC GOES HERE
             # =============================================
@@ -268,13 +257,14 @@ class TradingBot:
         #    - If Inventory is heavy (>500): Prioritize the order that reduces risk.
         # =================================================================
 
-
-
         # =================================================================
         # HARD SAFETY CAP
         # The rules say 5000 is the limit.
         # We stop buying at 4800 to account for any "in-flight" delays.
         # =================================================================
+
+        if self.current_step % 5 != 0:
+            return None
 
         # 1. Panic Sell (Too much inventory)
         if self.inventory >= 4800:
@@ -287,11 +277,9 @@ class TradingBot:
             return {"side": "BUY", "price": round(ask, 2), "qty": 100}
 
         # Only send orders every few steps to avoid overwhelming the system
-        #if self.current_step % 5 != 0:
-         #   return None
 
         mid = round(mid, 2)
-        skew = 0.0001
+        skew = 0.001
         current_spread = 0.02
 
         reservation_price = mid - (self.inventory * skew)
@@ -305,15 +293,20 @@ class TradingBot:
         # otherwise alternate iii) buying 0.05 below mid and iv) selling 0.05 above mid
         # python student_algorithm.py --name Quackonomics --password Pegg3d_M1dpoint_Ordr$ --scenario normal_market  --host 3.98.52.120:8433 --secure
 
+
         if self.inventory > 200:
+            self.inventory -= 100
             return {"side": "SELL", "price": round(bid, 2), "qty": 100}
 
         elif self.inventory < -200:
+            self.inventory += 100
             return {"side": "BUY", "price": round(ask, 2), "qty": 100}
 
         elif (self.current_step // 5) % 2 == 0:
+            self.inventory += 100
             return {"side": "BUY","price": my_bid,"qty": 100}
         else:
+            self.inventory -= 100
             return {"side": "SELL","price": my_ask,"qty": 100}
 
 
