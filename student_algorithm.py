@@ -295,18 +295,14 @@ class TradingBot:
 
 
         if self.inventory > 200:
-            self.inventory -= 100
             return {"side": "SELL", "price": round(bid, 2), "qty": 100}
 
         elif self.inventory < -200:
-            self.inventory += 100
             return {"side": "BUY", "price": round(ask, 2), "qty": 100}
 
         elif (self.current_step // 5) % 2 == 0:
-            self.inventory += 100
             return {"side": "BUY","price": my_bid,"qty": 100}
         else:
-            self.inventory -= 100
             return {"side": "SELL","price": my_ask,"qty": 100}
 
 
