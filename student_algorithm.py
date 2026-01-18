@@ -80,81 +80,74 @@ class MarketRegimeDetector:
             return "normal_market"
 
         prices = np.array(self.mid_prices, dtype=float)
-        spreads = np.array(self.spreads)
-        times = np.array(self.timestamps)
+        spreads = np.array(self.spreads, dtype=float)
+        times = np.array(self.timestamps, dtype=float)
 
-        # Window stats (same window you already use via deques)
-        window_start_time = times[0]
-        window_seconds = max(1e-6, times[-1] - window_start_time)
+        window_seconds = max(1e-6, times[-1] - times[0])
 
-        # tick_rate (ticks/sec)
-        tick_rate = (len(times) - 1) / window_seconds
-
-        # change_rate (changes/sec)
-        changes = [c for (t, c) in self.change_flags if t >= window_start_time]
-        change_rate = sum(changes) / window_seconds
-
-        # churn: how often spread changes (0..1)
-        churn = float(np.mean(np.diff(spreads) != 0.0)) if len(spreads) > 1 else 0.0
-
-        # pct_min: % of window sitting at minimum spread (0..1)
-        min_spread = float(np.min(spreads))
-        pct_min = float(np.mean(spreads <= (min_spread + 1e-9)))
-        # Returns / vol
+        # === Volatility
         rets = np.diff(prices) / (prices[:-1] + 1e-9)
         vol = float(np.std(rets[-50:])) if len(rets) else 0.0
 
-        # =========================
-        # Crash detection: drawdown + rebound (robust)
-        # =========================
-        w = min(50, len(prices))
-        recent = prices[-w:]
-        peak = float(np.max(recent))
-        trough = float(np.min(recent))
-
-        drawdown = 0.0 if peak == 0 else (trough - peak) / peak  # negative
-        rebound = 0.0 if (peak - trough) == 0 else (recent[-1] - trough) / (peak - trough)
-
-        if drawdown < -0.03:
-            if rebound < 0.20:
-                return "flash_crash"
-            if rebound > 0.60:
-                return "mini_flash_crash"
-            return "stressed_market"
-
-        # =========================
-        # Stressed: vol or spread blowout
-        # =========================
+        # === Spread stats
         recent_spreads = spreads[-50:] if len(spreads) >= 50 else spreads
-        spread_baseline = float(np.median(recent_spreads)) if len(recent_spreads) else 0.0
+        spread_med = float(np.median(recent_spreads)) if len(recent_spreads) else 0.0
+        spread_cv = np.std(recent_spreads) / (spread_med + 1e-9) if len(recent_spreads) else 0.0
         last_spread = float(recent_spreads[-1]) if len(recent_spreads) else 0.0
 
-        if vol > 0.006 or (spread_baseline > 0 and last_spread > 1.8 * spread_baseline):
-            return "stressed_market"
+        # === Tick + churn
+        tick_rate = (len(times) - 1) / window_seconds
+        changes = sum(c for (_, c) in self.change_flags)
+        change_rate = changes / window_seconds
 
-        # =========================
-        # HFT: high message rate + high quote churn + tight spread most of the time
-        # =========================
-        tick_rate = 0.0
-        if len(self.recv_times) >= 10:
-            dt = self.recv_times[-1] - self.recv_times[0]
-            if dt > 0:
-                tick_rate = (len(self.recv_times) - 1) / dt  # msgs per second
+        # === Flash crash detection
+        recent = prices[-50:]
+        peak_idx = np.argmax(recent)
+        trough_idx = np.argmin(recent)
+        peak = recent[peak_idx]
+        trough = recent[trough_idx]
 
-        # churn: how often the mid changes (proxy for quote updates)
-        churn = float(np.mean(np.abs(np.diff(recent)) > 1e-9)) if len(recent) > 1 else 0.0
+        drawdown = 0.0 if peak == 0 else (trough - peak) / peak
+        drop_speed = abs(trough_idx - peak_idx) / len(recent)  # normalized time
+        rebound = 0.0
+        if trough_idx < len(recent) - 1:
+            rebound = (recent[-1] - trough) / (peak - trough + 1e-9)
 
-        min_spread = float(np.min(recent_spreads)) if len(recent_spreads) else 0.0
-        pct_at_min = float(np.mean(recent_spreads <= (min_spread + 1e-9))) if len(recent_spreads) else 0.0
-        spread_cv = float(np.std(recent_spreads) / (float(np.mean(recent_spreads)) + 1e-9)) if len(recent_spreads) else 0.0
+        # === Classify crash regimes
+        if drawdown < -0.015 and drop_speed < 0.7:
+            if rebound < 0.25:
+                new_regime = "flash_crash"
+            elif rebound > 0.60:
+                new_regime = "mini_flash_crash"
+            else:
+                new_regime = "stressed_market"
+        elif (
+                vol > 0.003
+                or spread_cv > 0.35
+                or (spread_med > 0 and last_spread > 1.5 * spread_med)
+                or change_rate > 10
+        ):
+            new_regime = "stressed_market"
+        else:
+            # HFT detection
+            churn = float(np.mean(np.abs(np.diff(prices[-15:])) > 1e-9)) if len(prices) > 15 else 0.0
+            min_spread = float(np.min(recent_spreads)) if len(recent_spreads) else 0.0
+            pct_min = float(np.mean(recent_spreads <= (min_spread + 1e-9))) if len(recent_spreads) else 0.0
 
-        # DEBUG every so often (temporary)
-        # if len(self.recv_times) >= 10 and len(self.mid_prices) % 50 == 0:
-        #     print(f"[DEBUG] tick_rate={tick_rate:.1f}/s churn={churn:.2f} pct_min={pct_at_min:.2f} vol={vol:.5f}")
-        # HFT: high message rate AND high change rate, with low volatility
-        if churn > 0.20 and pct_min < 0.95 and vol < 0.002:
-            return "hft_dominated"
-        return "normal_market"
+            if tick_rate > 15 and churn > 0.2 and pct_min < 0.9 and vol < 0.002:
+                new_regime = "hft_dominated"
+            else:
+                new_regime = "normal_market"
+
+        # === Debug print
+        if hasattr(self, "_last_regime"):
+            if new_regime != self._last_regime:
+                print(f"[Regime Shift] {self._last_regime} → {new_regime}")
+            self._last_regime = new_regime
+        else:
+            self._last_regime = new_regime
+
+        return new_regime
 
 
 class TradingBot:
@@ -215,6 +208,16 @@ class TradingBot:
         self.last_inventory = 0
         self.has_open_order = False
 
+        self.last_hft_trade_step = -100
+        self.HFT_COOLDOWN = 15  # steps
+        self.HFT_MAX_INV = 300
+        self.hft_entry_price = None
+        self.hft_entry_step = None
+        self.HFT_HOLD_LIMIT = 120  # steps
+        self.HFT_EXIT_EDGE = 0.02
+        self.last_hft_trade_step = -10_000
+        self.pending_buys = 0
+        self.pending_sells = 0
 
 
     # =========================================================================
@@ -384,15 +387,29 @@ class TradingBot:
         if bid <= 0 or ask <= 0:
             return None
 
+        # === SMART POSITION RISK LAYER ===
+        SOFT_LIMIT = 4500
+        HARD_LIMIT = 5000
+        QTY = 100
+
+        effective_inventory = self.inventory + self.pending_buys - self.pending_sells
+        self.too_close_to_limit = abs(effective_inventory) >= SOFT_LIMIT
+
+        # Absolute hard limit: emergency flatten
+        if effective_inventory >= HARD_LIMIT:
+            return {"side": "SELL", "price": round(bid, 2), "qty": QTY}
+        elif effective_inventory <= -HARD_LIMIT:
+            return {"side": "BUY", "price": round(ask, 2), "qty": QTY}
+
         # ===== ABSOLUTE SAFETY =====
-        if self.has_open_order:
+        if self.has_open_order and self.current_market_type != "hft_dominated":
             return None
 
         # ===== PARAMETER SELECTION =====
         regime = self.current_market_type
        
         if regime == "flash_crash":
-            QTY = 500
+            QTY = 600
             EDGE = 0.015
             MAX_POS = 1000
 
@@ -408,35 +425,202 @@ class TradingBot:
             self.last_mini_trade_time = now
             if (ask - bid) < EDGE * 2:
                     return None
-            
-        else: # normal_market 
-            QTY = 500
-            EDGE = 0.015
-            MAX_POS = 1000
+        elif regime == "hft_dominated":
+            BASE_QTY = 100
+            MAX_QTY = 200
+            EDGE = 0.01
+            COOLDOWN = 5
+            HOLD_LIMIT = 20
+            SLIPPAGE_LIMIT = 0.004
+            HARD_LIMIT = 5000
+            REENTRY_DELAY = 10
 
-            if self.current_step % 5 != 0:
+            # === Effective inventory ===
+            effective_pos = self.inventory + self.pending_buys - self.pending_sells
+
+            # === Init state ===
+            if not hasattr(self, "hft_state"):
+                self.hft_state = {
+                    "mid_history": deque(maxlen=10),
+                    "last_entry_step": -1000,
+                    "entry_price": None,
+                    "direction": None,
+                    "trend_age": 0,
+                }
+
+            if not hasattr(self, "hft_last_exit_step"):
+                self.hft_last_exit_step = -1000
+
+            # === Cooldown / reentry delay ===
+            if (self.current_step - self.hft_state["last_entry_step"] < COOLDOWN or
+                    self.current_step - self.hft_last_exit_step < REENTRY_DELAY):
                 return None
 
-            if self.inventory >= 4800:
-                return {'side': 'SELL', 'price': bid, 'qty': 100}
-            if self.inventory <= -4800:
-                return {'side': 'BUY', 'price': ask, 'qty': 100} 
+            # === Update trend memory ===
+            self.hft_state["mid_history"].append(mid)
+            history = list(self.hft_state["mid_history"])
+            if len(history) < 6:
+                return None
 
-            mybid = round(mid - 0.05, 2)
-            myask = round(mid + 0.05, 2)
+            trend = history[-1] - history[0]
+            trend_confidence = abs(trend)
+            rand_factor = np.random.rand()
+            in_position = self.inventory != 0
 
-            if (self.current_step // 5) % 2 == 0:
-                return {
-                    "side": "BUY",
-                    "price": mybid,
-                    "qty": 100
-                }
+            # === Dynamically scale QTY based on trend confidence ===
+            scaled_qty = BASE_QTY if trend_confidence < 0.005 else MAX_QTY
+
+            # === ENTRY ===
+            if not in_position:
+                if trend > EDGE and rand_factor > 0.4 and effective_pos + scaled_qty <= HARD_LIMIT and not self.too_close_to_limit:
+                    self.hft_state.update({
+                        "last_entry_step": self.current_step,
+                        "entry_price": mid,
+                        "direction": "LONG",
+                        "trend_age": 0
+                    })
+                    return {
+                        "side": "BUY",
+                        "price": round(bid + EDGE, 2),
+                        "qty": scaled_qty
+                    }
+
+                elif trend < -EDGE and rand_factor > 0.4 and effective_pos - scaled_qty >= -HARD_LIMIT and not self.too_close_to_limit:
+                    self.hft_state.update({
+                        "last_entry_step": self.current_step,
+                        "entry_price": mid,
+                        "direction": "SHORT",
+                        "trend_age": 0
+                    })
+                    return {
+                        "side": "SELL",
+                        "price": round(ask - EDGE, 2),
+                        "qty": scaled_qty
+                    }
+
+            # === EXIT ===
             else:
-                return {
-                    "side": "SELL",
-                    "price": myask,
-                    "qty": 100
-                }
+                direction = self.hft_state["direction"]
+                entry_price = self.hft_state["entry_price"]
+                time_held = self.current_step - self.hft_state["last_entry_step"]
+                self.hft_state["trend_age"] += 1
+
+                exit_qty = BASE_QTY
+                exit_cond = False
+
+                if direction == "LONG":
+                    gain = mid - entry_price
+                    loss = entry_price - mid
+                    if gain >= EDGE or time_held > HOLD_LIMIT or loss > SLIPPAGE_LIMIT:
+                        exit_cond = True
+
+                elif direction == "SHORT":
+                    gain = entry_price - mid
+                    loss = mid - entry_price
+                    if gain >= EDGE or time_held > HOLD_LIMIT or loss > SLIPPAGE_LIMIT:
+                        exit_cond = True
+
+                if exit_cond:
+                    self.hft_last_exit_step = self.current_step
+                    self.hft_state["last_entry_step"] = self.current_step
+                    side = "SELL" if direction == "LONG" else "BUY"
+                    price = round(ask - EDGE, 2) if direction == "LONG" else round(bid + EDGE, 2)
+
+                    if (side == "SELL" and effective_pos - exit_qty >= -HARD_LIMIT) or \
+                            (side == "BUY" and effective_pos + exit_qty <= HARD_LIMIT):
+                        return {"side": side, "price": price, "qty": exit_qty}
+
+            return None
+        elif regime == "stressed_market":
+            BASE_QTY = 100
+            EDGE = 0.02
+            HARD_LIMIT = 5000
+            TRADE_EVERY = 4  # throttle: only trade every 4 steps
+
+            effective_pos = self.inventory + self.pending_buys - self.pending_sells
+
+            # Step throttle
+            if self.current_step % TRADE_EVERY != 0:
+                return None
+
+            # Init mid history
+            if not hasattr(self, "stressed_mid_history"):
+                self.stressed_mid_history = deque(maxlen=15)
+            if not hasattr(self, "last_stressed_trade_step"):
+                self.last_stressed_trade_step = -1000
+
+            self.stressed_mid_history.append(mid)
+            if len(self.stressed_mid_history) < 10:
+                return None
+
+            recent_avg = sum(self.stressed_mid_history) / len(self.stressed_mid_history)
+            deviation = mid - recent_avg
+
+            # Emergency flatten if beyond hard limits
+            if effective_pos >= HARD_LIMIT:
+                return {"side": "SELL", "price": round(bid, 2), "qty": BASE_QTY}
+            if effective_pos <= -HARD_LIMIT:
+                return {"side": "BUY", "price": round(ask, 2), "qty": BASE_QTY}
+
+            # === Mean-reversion fade logic ===
+            if deviation < -EDGE and effective_pos + BASE_QTY <= HARD_LIMIT and not self.too_close_to_limit:
+                self.last_stressed_trade_step = self.current_step
+                return {"side": "BUY", "price": round(bid + 0.01, 2), "qty": BASE_QTY}
+
+            elif deviation > EDGE and effective_pos - BASE_QTY >= -HARD_LIMIT and not self.too_close_to_limit:
+                self.last_stressed_trade_step = self.current_step
+                return {"side": "SELL", "price": round(ask - 0.01, 2), "qty": BASE_QTY}
+
+            # === Passive unwind occasionally ===
+            if abs(self.inventory) > 0 and np.random.rand() > 0.97:
+                side = "SELL" if self.inventory > 0 else "BUY"
+                price = round(bid + 0.01, 2) if side == "BUY" else round(ask - 0.01, 2)
+                self.last_stressed_trade_step = self.current_step
+                return {"side": side, "price": price, "qty": BASE_QTY}
+
+            return None
+        elif regime == "normal_market":
+            BASE_QTY = 100
+            EDGE = 0.015
+            HARD_LIMIT = 5000
+            TRADE_EVERY = 3  # throttle frequency
+
+            effective_pos = self.inventory + self.pending_buys - self.pending_sells
+
+            if self.current_step % TRADE_EVERY != 0:
+                return None
+
+            # Emergency flatten
+            if effective_pos >= HARD_LIMIT:
+                return {"side": "SELL", "price": round(bid, 2), "qty": BASE_QTY}
+            if effective_pos <= -HARD_LIMIT:
+                return {"side": "BUY", "price": round(ask, 2), "qty": BASE_QTY}
+
+            # === Trend bias helper ===
+            if not hasattr(self, "trend_buffer"):
+                self.trend_buffer = deque(maxlen=10)
+            self.trend_buffer.append(mid)
+            if len(self.trend_buffer) < self.trend_buffer.maxlen:
+                return None
+
+            avg_mid = sum(self.trend_buffer) / len(self.trend_buffer)
+            trend = mid - avg_mid  # positive = upward trend
+
+            # === Buy low logic ===
+            if bid < avg_mid - EDGE and not self.too_close_to_limit and effective_pos + BASE_QTY <= HARD_LIMIT:
+                return {"side": "BUY", "price": round(bid + 0.01, 2), "qty": BASE_QTY}
+
+            # === Sell high logic ===
+            if ask > avg_mid + EDGE and not self.too_close_to_limit and effective_pos - BASE_QTY >= -HARD_LIMIT:
+                return {"side": "SELL", "price": round(ask - 0.01, 2), "qty": BASE_QTY}
+
+            # === Flatten passively ===
+            if abs(self.inventory) > 0 and np.random.rand() > 0.98:
+                side = "SELL" if self.inventory > 0 else "BUY"
+                price = round(ask - 0.01, 2) if side == "SELL" else round(bid + 0.01, 2)
+                return {"side": side, "price": price, "qty": BASE_QTY}
+
+            return None
 
         # ===== FORCE FLATTEN =====
         if self.inventory > MAX_POS:
@@ -491,10 +675,14 @@ class TradingBot:
         self.has_open_order = True
         self.orders_sent += 1
         self.order_send_times[order_id] = time.time()
+
+        # === Track pending inventory ===
+        if order["side"] == "BUY":
+            self.pending_buys += order["qty"]
+        else:
+            self.pending_sells += order["qty"]
+
         print(f"[{self.student_id}] Sent order: {msg}")
-
-
-
 
     def _on_order_response(self, ws, message: str):
         """Handle order responses and fills."""
@@ -512,6 +700,10 @@ class TradingBot:
                 qty = data["qty"]
                 price = data["price"]
 
+                if data["side"] == "BUY":
+                    self.pending_buys -= qty
+                else:
+                    self.pending_sells -= qty
                 if data["side"] == "BUY":
                     self.inventory += qty
                     self.cash_flow -= qty * price
